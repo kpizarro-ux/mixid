@@ -16,3 +16,12 @@ class URLRequest(BaseModel):
 def identify(req: URLRequest):
     # ... (full logic for downloading, splitting, sending to AudD)
     return [{"time": "00:00", "track": "Artist – Title"}]
+
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/")
+def read_root():
+    return {"message": "Mixid API is live. Use POST /identify to analyze DJ sets."}
+
