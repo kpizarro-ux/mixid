@@ -3,13 +3,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
-import os, glob, tempfile, subprocess, pathlib, requests, logging, json
+import os, glob, tempfile, subprocess, pathlib, requests, logging, shutil
 
 # ========= Config =========
 SEGMENT_SECONDS = int(os.getenv("SEGMENT_SECONDS", "30"))
-MAX_SEGMENTS = int(os.getenv("MAX_SEGMENTS", "100"))  # ~50 min default; bump as needed
+MAX_SEGMENTS = int(os.getenv("MAX_SEGMENTS", "100"))  # ~50 minutes cap; raise as needed
 AUDD_API_TOKEN = os.getenv("AUDD_API_TOKEN")
-COOKIE_FILE = os.getenv("COOKIE_FILE")  # e.g. /etc/secrets/youtube_cookies.txt
+COOKIE_FILE = os.getenv("COOKIE_FILE")  # e.g., /etc/secrets/youtube_cookies.txt
 
 ALLOWED_ORIGINS = [
     "https://mixid-frontend.vercel.app",
@@ -29,7 +29,6 @@ app.add_middleware(
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("mixid")
 
-# ========= Models =========
 class URLRequest(BaseModel):
     url: str
 
@@ -38,7 +37,6 @@ class IdentifyResult(BaseModel):
     track: str
     spotify: Optional[str] = None
 
-# ========= Routes =========
 @app.get("/")
 def root():
     return {"message": "Mixid API is live. Use POST /identify to analyze DJ sets."}
@@ -47,17 +45,20 @@ def root():
 def health():
     return {"ok": True}
 
+def ts_from_idx(idx: int, step: int) -> str:
+    mm, ss = divmod(idx * step, 60)
+    return f"{mm:02}:{ss:02}"
+
 @app.post("/identify", response_model=List[IdentifyResult])
 def identify(req: URLRequest):
     if not req.url or len(req.url) < 8:
         raise HTTPException(status_code=400, detail="Invalid URL")
-
     if not AUDD_API_TOKEN:
         raise HTTPException(status_code=500, detail="Missing AUDD_API_TOKEN")
 
-    log.info(f"Identify URL: {req.url}")
+    log.info(f"mixid: Identify URL: {req.url}")
 
-    # Lazy import (keeps cold start quick)
+    # Lazy import for faster cold start
     import yt_dlp
     import imageio_ffmpeg
 
@@ -65,24 +66,31 @@ def identify(req: URLRequest):
     ffmpeg_dir = str(pathlib.Path(ffmpeg_exe).parent)
 
     with tempfile.TemporaryDirectory(prefix="mixid_") as tmp:
-        # 1) Download best audio → mp3
-        out = os.path.join(tmp, "source.%(ext)s")
+        # 0) If cookies are provided, copy to a writable temp path
+        cookiefile_for_ytdlp = None
+        if COOKIE_FILE and os.path.exists(COOKIE_FILE):
+            cookiefile_for_ytdlp = os.path.join(tmp, "cookies.txt")
+            try:
+                shutil.copy(COOKIE_FILE, cookiefile_for_ytdlp)
+            except Exception as e:
+                log.warning(f"Could not copy cookies file: {e}")
+                cookiefile_for_ytdlp = None
+
+        # 1) Download best audio WITHOUT postprocessors (avoid ffprobe requirement)
+        #    Let yt-dlp pick container (webm/m4a/opus/etc.)
+        out_tmpl = os.path.join(tmp, "source.%(ext)s")
         ydl_opts = {
             "format": "bestaudio/best",
-            "outtmpl": out,
+            "outtmpl": out_tmpl,
             "noplaylist": True,
             "quiet": True,
-            "prefer_ffmpeg": True,
-            "ffmpeg_location": ffmpeg_dir,
-            "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
-            ],
-            # cookies fix YouTube 429 / bot checks
-            **({"cookiefile": COOKIE_FILE} if COOKIE_FILE else {}),
-            # Slightly friendlier UA
-            "http_headers": {"User-Agent": "Mozilla/5.0 (Mixid yt-dlp)"},
             "retries": 3,
+            "http_headers": {"User-Agent": "Mozilla/5.0 (Mixid yt-dlp)"},
+            # Use our ffmpeg for any internal remux if needed
+            "ffmpeg_location": ffmpeg_dir,
         }
+        if cookiefile_for_ytdlp:
+            ydl_opts["cookiefile"] = cookiefile_for_ytdlp
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -92,23 +100,40 @@ def identify(req: URLRequest):
             log.error(msg)
             raise HTTPException(status_code=502, detail=msg)
 
-        # locate mp3
-        mp3 = None
-        for cand in ("source.mp3", "*.mp3"):
-            paths = glob.glob(os.path.join(tmp, cand))
-            if paths:
-                mp3 = paths[0]
-                break
-        if not mp3:
-            raise HTTPException(status_code=500, detail="Could not locate downloaded MP3")
+        # 2) Find the downloaded file (unknown extension)
+        src_candidates = glob.glob(os.path.join(tmp, "source.*"))
+        if not src_candidates:
+            # fallback catch-all
+            src_candidates = glob.glob(os.path.join(tmp, "*.*"))
+        if not src_candidates:
+            raise HTTPException(status_code=500, detail="No downloaded file found")
+        src_path = src_candidates[0]
 
-        # 2) Split into segments
+        # 3) Convert to MP3 ourselves with ffmpeg (no ffprobe needed)
+        mp3_path = os.path.join(tmp, "audio.mp3")
+        try:
+            # Re-encode to mp3 CBR 192k to keep AudD happy
+            subprocess.run(
+                [
+                    ffmpeg_exe, "-hide_banner", "-loglevel", "error",
+                    "-i", src_path,
+                    "-vn", "-acodec", "libmp3lame", "-b:a", "192k",
+                    mp3_path,
+                ],
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            msg = f"ffmpeg convert failed: {e}"
+            log.error(msg)
+            raise HTTPException(status_code=500, detail=msg)
+
+        # 4) Split MP3 into segments using stream copy (fast)
         seg_tpl = os.path.join(tmp, "seg_%05d.mp3")
         try:
             subprocess.run(
                 [
                     ffmpeg_exe, "-hide_banner", "-loglevel", "error",
-                    "-i", mp3,
+                    "-i", mp3_path,
                     "-f", "segment",
                     "-segment_time", str(SEGMENT_SECONDS),
                     "-c", "copy",
@@ -125,14 +150,12 @@ def identify(req: URLRequest):
         if not segments:
             raise HTTPException(status_code=500, detail="No segments created")
 
-        # 3) Call AudD for each segment
+        # 5) Send each segment to AudD
         results: List[IdentifyResult] = []
         last_title = None
+        segs = segments[:MAX_SEGMENTS]  # keep latency in check
 
-        # Safety cap to control latency/cost
-        segments = segments[:MAX_SEGMENTS]
-
-        for idx, seg in enumerate(segments):
+        for idx, seg in enumerate(segs):
             try:
                 with open(seg, "rb") as f:
                     r = requests.post(
@@ -146,7 +169,7 @@ def identify(req: URLRequest):
                     )
                 payload = r.json()
             except Exception as e:
-                log.warning(f"AUDD request failed on seg {idx}: {e}")
+                log.warning(f"AUDD request failed seg {idx}: {e}")
                 continue
 
             result = payload.get("result")
@@ -160,11 +183,9 @@ def identify(req: URLRequest):
 
             track_title = f"{artist} – {title}"
             if track_title == last_title:
-                # de‑dupe consecutive identical detection
                 continue
             last_title = track_title
 
-            mm, ss = divmod(idx * SEGMENT_SECONDS, 60)
             spotify_url = None
             try:
                 spotify_url = (
@@ -175,14 +196,12 @@ def identify(req: URLRequest):
             except Exception:
                 pass
 
-            results.append(IdentifyResult(
-                time=f"{mm:02}:{ss:02}",
-                track=track_title,
-                spotify=spotify_url
-            ))
+            results.append(
+                IdentifyResult(
+                    time=ts_from_idx(idx, SEGMENT_SECONDS),
+                    track=track_title,
+                    spotify=spotify_url,
+                )
+            )
 
-        if not results:
-            return [IdentifyResult(time="00:00", track="No matches found")]
-
-        return results
-
+        return results or [IdentifyResult(time="00:00", track="No matches found")]
