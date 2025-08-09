@@ -2,18 +2,21 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
-import os, glob, tempfile, subprocess, pathlib, requests
+from typing import List, Optional
+import os, glob, tempfile, subprocess, pathlib, requests, logging, json
 
-# -------- Settings --------
-SEGMENT_SECONDS = 30
-AUDD_API_TOKEN = os.getenv("AUDD_API_TOKEN")  # set in Render → Environment
+# ========= Config =========
+SEGMENT_SECONDS = int(os.getenv("SEGMENT_SECONDS", "30"))
+MAX_SEGMENTS = int(os.getenv("MAX_SEGMENTS", "100"))  # ~50 min default; bump as needed
+AUDD_API_TOKEN = os.getenv("AUDD_API_TOKEN")
+COOKIE_FILE = os.getenv("COOKIE_FILE")  # e.g. /etc/secrets/youtube_cookies.txt
 
 ALLOWED_ORIGINS = [
     "https://mixid-frontend.vercel.app",
     "http://localhost:5173",
 ]
 
+# ========= App =========
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -23,9 +26,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("mixid")
+
+# ========= Models =========
 class URLRequest(BaseModel):
     url: str
 
+class IdentifyResult(BaseModel):
+    time: str
+    track: str
+    spotify: Optional[str] = None
+
+# ========= Routes =========
 @app.get("/")
 def root():
     return {"message": "Mixid API is live. Use POST /identify to analyze DJ sets."}
@@ -34,22 +47,17 @@ def root():
 def health():
     return {"ok": True}
 
-# ---------- Helpers ----------
-def _timestamp_from_index(idx: int, step: int) -> str:
-    total = idx * step
-    mm, ss = divmod(total, 60)
-    return f"{mm:02}:{ss:02}"
-
-# ---------- Main endpoint ----------
-@app.post("/identify")
-def identify(req: URLRequest) -> List[dict]:
+@app.post("/identify", response_model=List[IdentifyResult])
+def identify(req: URLRequest):
     if not req.url or len(req.url) < 8:
         raise HTTPException(status_code=400, detail="Invalid URL")
 
     if not AUDD_API_TOKEN:
         raise HTTPException(status_code=500, detail="Missing AUDD_API_TOKEN")
 
-    # Lazy imports so cold starts are faster
+    log.info(f"Identify URL: {req.url}")
+
+    # Lazy import (keeps cold start quick)
     import yt_dlp
     import imageio_ffmpeg
 
@@ -65,17 +73,24 @@ def identify(req: URLRequest) -> List[dict]:
             "noplaylist": True,
             "quiet": True,
             "prefer_ffmpeg": True,
-            "ffmpeg_location": ffmpeg_dir,  # use bundled ffmpeg
+            "ffmpeg_location": ffmpeg_dir,
             "postprocessors": [
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
             ],
+            # cookies fix YouTube 429 / bot checks
+            **({"cookiefile": COOKIE_FILE} if COOKIE_FILE else {}),
+            # Slightly friendlier UA
+            "http_headers": {"User-Agent": "Mozilla/5.0 (Mixid yt-dlp)"},
+            "retries": 3,
         }
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([req.url])
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Download failed: {e}")
+            msg = f"Download failed: {e}"
+            log.error(msg)
+            raise HTTPException(status_code=502, detail=msg)
 
         # locate mp3
         mp3 = None
@@ -87,14 +102,12 @@ def identify(req: URLRequest) -> List[dict]:
         if not mp3:
             raise HTTPException(status_code=500, detail="Could not locate downloaded MP3")
 
-        # 2) Split into 30s segments using stream copy (fast)
+        # 2) Split into segments
         seg_tpl = os.path.join(tmp, "seg_%05d.mp3")
         try:
             subprocess.run(
                 [
-                    ffmpeg_exe,
-                    "-hide_banner",
-                    "-loglevel", "error",
+                    ffmpeg_exe, "-hide_banner", "-loglevel", "error",
                     "-i", mp3,
                     "-f", "segment",
                     "-segment_time", str(SEGMENT_SECONDS),
@@ -104,20 +117,22 @@ def identify(req: URLRequest) -> List[dict]:
                 check=True,
             )
         except subprocess.CalledProcessError as e:
-            raise HTTPException(status_code=500, detail=f"ffmpeg split failed: {e}")
+            msg = f"ffmpeg split failed: {e}"
+            log.error(msg)
+            raise HTTPException(status_code=500, detail=msg)
 
         segments = sorted(glob.glob(os.path.join(tmp, "seg_*.mp3")))
         if not segments:
             raise HTTPException(status_code=500, detail="No segments created")
 
-        # 3) Send each segment to AudD
-        results: List[dict] = []
+        # 3) Call AudD for each segment
+        results: List[IdentifyResult] = []
         last_title = None
 
-        for idx, seg in enumerate(segments):
-            # Safety cap for free tier latency; raise/remove for full sets
-            # if idx >= 60: break  # ~30 minutes
+        # Safety cap to control latency/cost
+        segments = segments[:MAX_SEGMENTS]
 
+        for idx, seg in enumerate(segments):
             try:
                 with open(seg, "rb") as f:
                     r = requests.post(
@@ -131,7 +146,7 @@ def identify(req: URLRequest) -> List[dict]:
                     )
                 payload = r.json()
             except Exception as e:
-                # Skip transient errors gracefully
+                log.warning(f"AUDD request failed on seg {idx}: {e}")
                 continue
 
             result = payload.get("result")
@@ -144,19 +159,30 @@ def identify(req: URLRequest) -> List[dict]:
                 continue
 
             track_title = f"{artist} – {title}"
-
-            # de‑dupe consecutive identical hits
             if track_title == last_title:
+                # de‑dupe consecutive identical detection
                 continue
             last_title = track_title
 
-            results.append({
-                "time": _timestamp_from_index(idx, SEGMENT_SECONDS),
-                "track": track_title,
-                # Optional:
-                # "spotify": result.get("spotify", {}).get("external_urls", {}).get("spotify"),
-            })
+            mm, ss = divmod(idx * SEGMENT_SECONDS, 60)
+            spotify_url = None
+            try:
+                spotify_url = (
+                    result.get("spotify", {})
+                          .get("external_urls", {})
+                          .get("spotify")
+                )
+            except Exception:
+                pass
 
-        return results or [{"time": "00:00", "track": "No matches found"}]
+            results.append(IdentifyResult(
+                time=f"{mm:02}:{ss:02}",
+                track=track_title,
+                spotify=spotify_url
+            ))
 
+        if not results:
+            return [IdentifyResult(time="00:00", track="No matches found")]
+
+        return results
 
