@@ -1,6 +1,6 @@
 fastapi
-uvicorn
-pydantic
+uvicorn[standard]
 requests
 yt-dlp
-python-dotenv
+imageio-ffmpeg
+pydantic
